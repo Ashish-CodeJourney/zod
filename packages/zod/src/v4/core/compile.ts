@@ -12,7 +12,10 @@ import {
   isValidIPv6,
   isValidJWT,
   mergeValues,
-  parseValidURL,
+  parseURLObject,
+  stripTabAndNewline,
+  urlHostnameOk,
+  urlProtocolOk,
 } from "./schemas.js";
 import type { ParseContextInternal, ParsePayload, SomeType } from "./schemas.js";
 import * as util from "./util.js";
@@ -46,9 +49,13 @@ export class ZodCompileAsyncError extends Error {
  * they should not be compiling that schema.
  */
 export class ZodCompileUnsupportedError extends Error {
-  constructor(feature: string) {
+  /** Whether a container may absorb this refusal by running the child through the runtime (see `compileChild`). False when running only that node on the runtime is not equivalent to running the whole parse there — a runtime island gets no parse context, so a node that *consumes* issues rather than propagating them would finalize them against the wrong error map and still succeed. */
+  readonly islandable: boolean;
+
+  constructor(feature: string, islandable = true) {
     super(`z.compile does not support ${feature}; this schema must use the runtime parser`);
     this.name = "ZodCompileUnsupportedError";
+    this.islandable = islandable;
   }
 }
 
@@ -262,7 +269,7 @@ function compileChild(doc: Doc, ctx: CompileContext, schema: SomeType, accessor:
   try {
     return generateCheck(doc, ctx, schema, accessor);
   } catch (err) {
-    if (!(err instanceof ZodCompileUnsupportedError)) throw err;
+    if (!(err instanceof ZodCompileUnsupportedError) || !err.islandable) throw err;
     doc.content.length = contentLen;
     if (ctx.constants.size > constantCount) {
       const trailing = Array.from(ctx.constants.keys()).slice(constantCount);
@@ -319,15 +326,34 @@ function generateChecks(doc: Doc, ctx: CompileContext, schema: SomeType, accesso
       case "number_format":
         generateNumberFormatCheck(doc, def, currentAccessor);
         break;
-      case "min_length":
-        doc.write(`if (${currentAccessor}.length < ${numericOperand(def.minimum, "min_length")}) return INVALID;`);
+      case "min_length": {
+        const min = numericOperand(def.minimum, "min_length");
+        const len = codePointLengthVar(
+          doc,
+          ctx,
+          currentAccessor,
+          `${currentAccessor}.length >= ${min} && ${currentAccessor}.length < ${def.minimum * 2}`
+        );
+        doc.write(`if (${len} < ${min}) return INVALID;`);
         break;
-      case "max_length":
-        doc.write(`if (${currentAccessor}.length > ${numericOperand(def.maximum, "max_length")}) return INVALID;`);
+      }
+      case "max_length": {
+        const max = numericOperand(def.maximum, "max_length");
+        const len = codePointLengthVar(doc, ctx, currentAccessor, `${currentAccessor}.length > ${max}`);
+        doc.write(`if (${len} > ${max}) return INVALID;`);
         break;
-      case "length_equals":
-        doc.write(`if (${currentAccessor}.length !== ${numericOperand(def.length, "length_equals")}) return INVALID;`);
+      }
+      case "length_equals": {
+        const exact = numericOperand(def.length, "length_equals");
+        const len = codePointLengthVar(
+          doc,
+          ctx,
+          currentAccessor,
+          `${currentAccessor}.length >= ${exact} && ${currentAccessor}.length <= ${def.length * 2}`
+        );
+        doc.write(`if (${len} !== ${exact}) return INVALID;`);
         break;
+      }
       case "min_size":
         doc.write(`if (${currentAccessor}.size < ${numericOperand(def.minimum, "min_size")}) return INVALID;`);
         break;
@@ -367,6 +393,14 @@ function generateChecks(doc: Doc, ctx: CompileContext, schema: SomeType, accesso
   }
 
   return currentAccessor;
+}
+
+// Emit the length operand for a length check, mirroring `$ZodCheckMinLength` and friends: strings measure in code points, everything else in `.length`. `inDoubt` is the caller's cheap UTF-16 bound test — outside it the unit count already settles the comparison, so the scan is skipped.
+function codePointLengthVar(doc: Doc, ctx: CompileContext, accessor: string, inDoubt: string): string {
+  const cpLen = addConstant(ctx, util.codePointLength);
+  const v = newVar(ctx);
+  doc.write(`const ${v} = typeof ${accessor} === "string" && ${inDoubt} ? ${cpLen}(${accessor}) : ${accessor}.length;`);
+  return v;
 }
 
 // Emit a source operand for a gt/lt bound. Numbers inline; Dates hoist as a constant (relational operators compare via valueOf). NaN and Invalid Date bounds can't compile to a comparison that matches runtime semantics.
@@ -675,11 +709,25 @@ function generateStringFormatCheck(doc: Doc, ctx: CompileContext, def: StringFor
     formatDef.hostname !== undefined ||
     formatDef.protocol !== undefined
   ) {
-    const validator = addConstant(ctx, parseValidURL);
+    // Same three predicates the runtime calls, in the same order, so there is no second URL implementation to drift. Which options exist is known now, so the calls the runtime makes conditionally are emitted conditionally instead.
+    const parseConst = addConstant(ctx, parseURLObject);
     const defConst = addConstant(ctx, def);
+    const trimVar = newVar(ctx);
+    const urlVar = newVar(ctx);
+    doc.write(`const ${trimVar} = ${accessor}.trim();`);
+    doc.write(`const ${urlVar} = ${parseConst}(${trimVar}, ${defConst});`);
+    doc.write(`if (typeof ${urlVar} === "number") return INVALID;`);
+    if (formatDef.hostname !== undefined) {
+      const hostnameConst = addConstant(ctx, urlHostnameOk);
+      doc.write(`if (!${hostnameConst}(${urlVar}, ${defConst}.hostname)) return INVALID;`);
+    }
+    if (formatDef.protocol !== undefined) {
+      const protocolConst = addConstant(ctx, urlProtocolOk);
+      doc.write(`if (!${protocolConst}(${urlVar}, ${defConst}.protocol)) return INVALID;`);
+    }
     const outputVar = newVar(ctx);
-    doc.write(`const ${outputVar} = ${validator}(${accessor}, ${defConst});`);
-    doc.write(`if (${outputVar} === undefined) return INVALID;`);
+    const outputExpr = formatDef.normalize ? `${urlVar}.href` : `${addConstant(ctx, stripTabAndNewline)}(${trimVar})`;
+    doc.write(`const ${outputVar} = ${outputExpr};`);
     return outputVar;
   }
 
@@ -1070,9 +1118,9 @@ function generateObjectCheck(doc: Doc, ctx: CompileContext, schema: SomeType, ac
   }
   // else: strip mode (no catchall) - unknown keys ignored, only include known keys
 
-  // Build the output: shape keys first in declared order (the runtime assigns them before its catchall loop), then unknown keys in for...in order. Runtime inclusion rule (handlePropertyResult): a key is included iff its output value !== undefined OR the key is present on the input. Props that can never output undefined keep the fast object-literal form.
+  // Build the output: shape keys first in declared order (the runtime assigns them before its catchall loop), then unknown keys in for...in order. Runtime inclusion rule (handlePropertyResult): a key on the middle rung is included iff the key is present on the input; otherwise iff its output value !== undefined OR the key is present. Props that can never output undefined keep the fast object-literal form.
   const outputVar = newVar(ctx);
-  const hasConditionalKeys = keys.some((k) => mayOutputUndefined(shape[k]!));
+  const hasConditionalKeys = keys.some((k) => mayOutputUndefined(shape[k]!) || dropsWhenAbsent(shape[k]!));
 
   if (!hasConditionalKeys) {
     const propLiterals = keys.map((k) => `${util.esc(k)}: ${propOutputs[k]}`).join(", ");
@@ -1080,7 +1128,9 @@ function generateObjectCheck(doc: Doc, ctx: CompileContext, schema: SomeType, ac
   } else {
     doc.write(`const ${outputVar} = {};`);
     for (const k of keys) {
-      if (mayOutputUndefined(shape[k]!)) {
+      if (dropsWhenAbsent(shape[k]!)) {
+        doc.write(`if (${util.esc(k)} in ${accessor}) ${outputVar}[${util.esc(k)}] = ${propOutputs[k]};`);
+      } else if (mayOutputUndefined(shape[k]!)) {
         doc.write(
           `if (${propOutputs[k]} !== undefined || ${util.esc(k)} in ${accessor}) ${outputVar}[${util.esc(k)}] = ${propOutputs[k]};`
         );
@@ -1232,6 +1282,11 @@ function fastPathAcceptsAbsence(schema: SomeType): boolean {
     default:
       return true;
   }
+}
+
+/** The middle rung permits absence without supplying anything in its place, so an absent key contributes nothing — mirrors the leading gate in `handlePropertyResult`. */
+function dropsWhenAbsent(schema: SomeType): boolean {
+  return schema._zod.optin === "optional" && schema._zod.optout === "optional";
 }
 
 // Whether a schema's success-path output can be `undefined`. Object output
@@ -1478,6 +1533,11 @@ function generateTupleCheck(doc: Doc, ctx: CompileContext, schema: SomeType, acc
         });
         d.write(`} else {`);
         d.indented((d2) => {
+          // Middle rung: absence supplies nothing in its place, so truncate rather than running the item on `undefined` and keeping what it invents. Mirrors the leading gate in `handleTupleResults`.
+          if (dropsWhenAbsent(itemSchema)) {
+            d2.write(`${outputVar}.length = ${i};`);
+            return;
+          }
           const elemVar = newVar(ctx);
           const branchVar = newVar(ctx);
           d2.write(`const ${elemVar} = undefined;`);
@@ -1615,10 +1675,19 @@ function generateDiscriminatedUnionCheck(
   doc.write(`let ${outputVar};`);
 
   let firstBranch = true;
+  const claimed = new Set<util.Primitive>();
   for (const option of def.options) {
     const values = option._zod.propValues?.[def.discriminator];
     if (!values || values.size === 0) {
       throw new ZodCompileUnsupportedError("discriminated union option without static discriminator values");
+    }
+
+    // Two options claiming one value are not discriminable, and the branch chain below would silently give it to the first. Declining to compile hands that back to the interpreter, whose own map build reports it.
+    for (const value of values) {
+      if (claimed.has(value)) {
+        throw new ZodCompileUnsupportedError(`duplicate discriminator value ${String(value)}`);
+      }
+      claimed.add(value);
     }
 
     const conditions = Array.from(values, (value) => literalEquality(ctx, discVar, value));
@@ -1954,9 +2023,11 @@ function generateCatchCheck(doc: Doc, ctx: CompileContext, schema: SomeType, acc
     catchValue: (ctx: any) => unknown;
   };
 
-  // `.catch(value)` synthesises a tagged thunk for a constant, so anything untagged is a user callback. Every callback is refused, not just one that reads `ctx.error`: whether it does is undecidable here, and a callback that reads it needs issues finalized against the caller's per-parse error map, which generated code never sees. Producing them here gave a different message than `.parse(input, { error })` and, because catch *succeeds*, nothing downstream could notice. Refuse at codegen instead: returning INVALID would be a bail-out, and a union reads that as a rejected branch rather than a reason to hand the whole parse back.
+  // `.catch(value)` synthesises a tagged thunk for a constant, so anything untagged is a user callback. Every callback is refused, not just one that reads `ctx.error`: whether it does is undecidable here, and a callback that reads it needs issues finalized against the caller's per-parse error map, which generated code never sees. Producing them here gives a different message than `.parse(input, { error })` and, because catch *succeeds*, nothing downstream can notice. Refuse at codegen instead: returning INVALID would be a bail-out, and a union reads that as a rejected branch rather than a reason to hand the whole parse back.
+  //
+  // Not islandable either. A runtime island runs only this node through the runtime, and `runtimeRun` has no parse context to hand it, so an islanded catch finalizes against an empty context and *succeeds* with the wrong message — the same divergence, reintroduced by the container that was trying to tolerate it.
   if (!(def.catchValue as { [util.CONSTANT_CATCH]?: boolean })[util.CONSTANT_CATCH]) {
-    throw new ZodCompileUnsupportedError("catch with a callback (only a constant catch value compiles)");
+    throw new ZodCompileUnsupportedError("catch with a callback (only a constant catch value compiles)", false);
   }
 
   const outputVar = newVar(ctx);

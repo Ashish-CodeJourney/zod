@@ -1,4 +1,3 @@
-import type { $ZodTypeDiscriminable } from "./api.js";
 import * as checks from "./checks.js";
 import * as core from "./core.js";
 import { Doc } from "./doc.js";
@@ -499,59 +498,44 @@ export interface $ZodURL extends $ZodType {
   _zod: $ZodURLInternals;
 }
 
-// URL.canParse: Node 18.17+, Safari 17+; fall back for older runtimes. Resolved on first use rather than at module scope — a top-level `.bind()` is a call, so bundlers cannot prove it side-effect free and keep it in every build, including ones that never touch z.url().
-let urlCanParseImpl: ((s: string) => boolean) | undefined;
-function urlCanParse(s: string): boolean {
-  urlCanParseImpl ??=
-    typeof URL.canParse === "function"
-      ? URL.canParse.bind(URL)
-      : (v: string) => {
-          try {
-            new URL(v);
-            return true;
-          } catch {
-            return false;
-          }
-        };
-  return urlCanParseImpl(s);
-}
+/** The `://` guard rejected the input before the URL constructor saw it. */
+export const URL_BAD_FORMAT = 1;
+/** The URL constructor rejected the input. */
+export const URL_UNPARSEABLE = 2;
 
-export function parseValidURL(
-  data: string,
-  def: Pick<$ZodURLDef, "hostname" | "protocol" | "normalize">
-): string | undefined {
-  const trimmed = data.trim();
-
-  // Bare z.url() (no hostname/protocol/normalize options) skips the parsed-URL path entirely. URL.canParse avoids the try/catch on invalid input.
-  if (!def.hostname && !def.protocol && !def.normalize) {
-    return urlCanParse(trimmed) ? trimmed : undefined;
-  }
-
-  // When normalize is off, require :// for http/https URLs. This prevents strings like "http:example.com" or "https:/path" from being silently accepted by URL.
+/** Parses a URL for `$ZodURL`, applying the one guard the URL constructor cannot express. Returns the parsed URL, or a code naming the stage that rejected it — the runtime needs that distinction to pick an issue note, and compiled code only needs to know it is not a URL. */
+export function parseURLObject(
+  trimmed: string,
+  def: Pick<$ZodURLDef, "protocol" | "normalize">
+): URL | typeof URL_BAD_FORMAT | typeof URL_UNPARSEABLE {
+  // When normalize is off, require :// for http/https URLs. This prevents strings like "http:example.com" or "https:/path" from being silently accepted
   if (!def.normalize && def.protocol?.source === regexes.httpProtocol.source && !/^https?:\/\//i.test(trimmed)) {
-    return undefined;
+    return URL_BAD_FORMAT;
   }
 
-  let url: URL;
   try {
     // @ts-ignore
-    url = new URL(trimmed);
+    return new URL(trimmed);
   } catch {
-    return undefined;
+    return URL_UNPARSEABLE;
   }
+}
 
-  if (def.hostname) {
-    def.hostname.lastIndex = 0;
-    if (!def.hostname.test(url.hostname)) return undefined;
-  }
+const asciiTabOrNewline = /[\t\n\r]/g;
 
-  if (def.protocol) {
-    def.protocol.lastIndex = 0;
-    const protocol = url.protocol.endsWith(":") ? url.protocol.slice(0, -1) : url.protocol;
-    if (!def.protocol.test(protocol)) return undefined;
-  }
+/** The URL parser deletes every ASCII tab, LF and CR from its input before it parses, so `new URL("https://exa\nmple.com")` reports on `example.com`. Applying the same deletion to the returned value closes the half of that divergence which can move the host; the parser's other rewrite, stripping C0 controls at the edges, cannot. */
+export function stripTabAndNewline(value: string): string {
+  return value.replace(asciiTabOrNewline, "");
+}
 
-  return def.normalize ? url.href : trimmed;
+export function urlHostnameOk(url: URL, hostname: RegExp): boolean {
+  hostname.lastIndex = 0;
+  return hostname.test(url.hostname);
+}
+
+export function urlProtocolOk(url: URL, protocol: RegExp): boolean {
+  protocol.lastIndex = 0;
+  return protocol.test(url.protocol.endsWith(":") ? url.protocol.slice(0, -1) : url.protocol);
 }
 
 export const $ZodURL: core.$constructor<$ZodURL> = /*@__PURE__*/ core.$constructor("$ZodURL", (inst, def) => {
@@ -560,63 +544,57 @@ export const $ZodURL: core.$constructor<$ZodURL> = /*@__PURE__*/ core.$construct
     try {
       // Trim whitespace from input
       const trimmed = payload.value.trim();
+      const url = parseURLObject(trimmed, def);
 
-      // When normalize is off, require :// for http/https URLs. This prevents strings like "http:example.com" or "https:/path" from being silently accepted
-      if (!def.normalize && def.protocol?.source === regexes.httpProtocol.source) {
-        if (!/^https?:\/\//i.test(trimmed)) {
-          payload.issues.push({
-            code: "invalid_format",
-            format: "url",
-            note: "Invalid URL format",
-            input: payload.value,
-            inst,
-            continue: !def.abort,
-          });
-          return;
-        }
+      if (url === URL_BAD_FORMAT) {
+        payload.issues.push({
+          code: "invalid_format",
+          format: "url",
+          note: "Invalid URL format",
+          input: payload.value,
+          inst,
+          continue: !def.abort,
+        });
+        return;
       }
 
-      // @ts-ignore
-      const url = new URL(trimmed);
-
-      if (def.hostname) {
-        def.hostname.lastIndex = 0;
-        if (!def.hostname.test(url.hostname)) {
-          payload.issues.push({
-            code: "invalid_format",
-            format: "url",
-            note: "Invalid hostname",
-            pattern: def.hostname.source,
-            input: payload.value,
-            inst,
-            continue: !def.abort,
-          });
-        }
+      if (url === URL_UNPARSEABLE) {
+        payload.issues.push({
+          code: "invalid_format",
+          format: "url",
+          input: payload.value,
+          inst,
+          continue: !def.abort,
+        });
+        return;
       }
 
-      if (def.protocol) {
-        def.protocol.lastIndex = 0;
-        if (!def.protocol.test(url.protocol.endsWith(":") ? url.protocol.slice(0, -1) : url.protocol)) {
-          payload.issues.push({
-            code: "invalid_format",
-            format: "url",
-            note: "Invalid protocol",
-            pattern: def.protocol.source,
-            input: payload.value,
-            inst,
-            continue: !def.abort,
-          });
-        }
+      if (def.hostname && !urlHostnameOk(url, def.hostname)) {
+        payload.issues.push({
+          code: "invalid_format",
+          format: "url",
+          note: "Invalid hostname",
+          pattern: def.hostname.source,
+          input: payload.value,
+          inst,
+          continue: !def.abort,
+        });
+      }
+
+      if (def.protocol && !urlProtocolOk(url, def.protocol)) {
+        payload.issues.push({
+          code: "invalid_format",
+          format: "url",
+          note: "Invalid protocol",
+          pattern: def.protocol.source,
+          input: payload.value,
+          inst,
+          continue: !def.abort,
+        });
       }
 
       // Set the output value based on normalize flag
-      if (def.normalize) {
-        // Use normalized URL
-        payload.value = url.href;
-      } else {
-        // Preserve the original input (trimmed)
-        payload.value = trimmed;
-      }
+      payload.value = def.normalize ? url.href : stripTabAndNewline(trimmed);
 
       return;
     } catch (_) {
@@ -876,7 +854,11 @@ export interface $ZodIPv6 extends $ZodType {
   _zod: $ZodIPv6Internals;
 }
 
+/** An IPv6 address is written with hex digits, colons and dots, and nothing else. The guard is what makes the check below an IPv6 check: `new URL("http://[...]")` parses an authority, not an address, so `@` and `\` re-delimit it and `"::@1\\"` validates against the host `0.0.0.1`. The URL parser also deletes ASCII tab, LF and CR rather than failing, which is how `"::1\n"` validated as `::1`. */
+const ipv6Alphabet = /^[0-9a-fA-F:.]+$/;
+
 export function isValidIPv6(value: string): boolean {
+  if (!ipv6Alphabet.test(value)) return false;
   try {
     // @ts-ignore
     new URL(`http://[${value}]`);
@@ -969,13 +951,7 @@ export function isValidCIDRv6(value: string): boolean {
   const prefixNum = Number(prefix);
   if (`${prefixNum}` !== prefix) return false;
   if (prefixNum < 0 || prefixNum > 128) return false;
-  try {
-    // @ts-ignore
-    new URL(`http://[${address}]`);
-    return true;
-  } catch {
-    return false;
-  }
+  return isValidIPv6(address);
 }
 
 export const $ZodCIDRv6: core.$constructor<$ZodCIDRv6> = /*@__PURE__*/ core.$constructor(
@@ -1893,19 +1869,24 @@ function handlePropertyResult(
   final: ParsePayload,
   key: PropertyKey,
   input: any,
-  isOptionalIn: boolean,
-  isOptionalOut: boolean
+  optin: "optional" | "defaulted" | undefined,
+  optout: "optional" | undefined
 ) {
   const isPresent = key in input;
+  const isOptionalOut = optout === "optional";
+  // The middle rung means "absence permitted, nothing supplied in its place", so an absent key contributes nothing — whatever the schema made of `undefined` is invented, not substituted. Only `optional` reaches this with a value: `defaulted` substitutes, and a schema that isn't optional-out has to keep the key.
+  if (!isPresent && isOptionalOut && optin === "optional") {
+    return;
+  }
   if (result.issues.length) {
     // For optional-in/out schemas, ignore errors on absent keys.
-    if (isOptionalIn && isOptionalOut && !isPresent) {
+    if (optin !== undefined && isOptionalOut && !isPresent) {
       return;
     }
     final.issues.push(...util.prefixIssues(key, result.issues));
   }
 
-  if (!isPresent && !isOptionalIn) {
+  if (!isPresent && optin === undefined) {
     if (!result.issues.length) {
       final.issues.push({
         code: "invalid_type",
@@ -2006,8 +1987,8 @@ function handleCatchall(
   const keySet = def.keySet;
   const _catchall = def.catchall!._zod;
   const t = _catchall.def.type;
-  const isOptionalIn = _catchall.optin !== undefined;
-  const isOptionalOut = _catchall.optout === "optional";
+  const optin = _catchall.optin;
+  const optout = _catchall.optout;
   for (const key in input) {
     // Must precede the __proto__ branch: a declared key is not unrecognized, even though the shape loop deliberately strips __proto__ from the parsed output.
     if (keySet.has(key)) continue;
@@ -2023,9 +2004,9 @@ function handleCatchall(
     const r = _catchall.run({ value: input[key], issues: [] }, ctx);
 
     if (r instanceof Promise) {
-      proms.push(r.then((r) => handlePropertyResult(r, payload, key, input, isOptionalIn, isOptionalOut)));
+      proms.push(r.then((r) => handlePropertyResult(r, payload, key, input, optin, optout)));
     } else {
-      handlePropertyResult(r, payload, key, input, isOptionalIn, isOptionalOut);
+      handlePropertyResult(r, payload, key, input, optin, optout);
     }
   }
 
@@ -2046,6 +2027,9 @@ function handleCatchall(
   });
 }
 
+// Whichever object a def's `shape` currently answers from: the one the caller passed until the first read, the frozen copy after it. Keyed by def, so a def rebuilt by a builder is simply absent rather than inheriting the source's. Read its keys with `Object.keys`, which does not invoke them — that is what lets a discriminated union check its discriminator without resolving an option whose getters reference the union being constructed.
+const propShapes = new WeakMap<object, Record<string, unknown>>();
+
 export const $ZodObject: core.$constructor<$ZodObject> = /*@__PURE__*/ core.$constructor("$ZodObject", (inst, def) => {
   // requires cast because technically $ZodObject doesn't extend
   $ZodType.init(inst, def);
@@ -2053,12 +2037,14 @@ export const $ZodObject: core.$constructor<$ZodObject> = /*@__PURE__*/ core.$con
   const desc = Object.getOwnPropertyDescriptor(def, "shape");
   if (!desc?.get) {
     const sh = def.shape;
+    propShapes.set(def, sh);
     Object.defineProperty(def, "shape", {
       get: () => {
         const newSh = { ...sh };
         Object.defineProperty(def, "shape", {
           value: newSh,
         });
+        propShapes.set(def, newSh);
 
         return newSh;
       },
@@ -2077,6 +2063,8 @@ export const $ZodObject: core.$constructor<$ZodObject> = /*@__PURE__*/ core.$con
           util.assignProp(propValues, key, new Set());
         }
         for (const v of field.values) propValues[key].add(v);
+        // An omittable slot reads back as undefined at a discriminator lookup, so it has to claim undefined: two options that can both omit the key are not discriminable on it.
+        if (field.optin !== undefined) propValues[key].add(undefined);
       }
     }
     return propValues;
@@ -2109,14 +2097,14 @@ export const $ZodObject: core.$constructor<$ZodObject> = /*@__PURE__*/ core.$con
     for (const key of value.keys) {
       if (key === "__proto__") continue;
       const el = shape[key]!;
-      const isOptionalIn = el._zod.optin !== undefined;
-      const isOptionalOut = el._zod.optout === "optional";
+      const optin = el._zod.optin;
+      const optout = el._zod.optout;
 
       const r = el._zod.run({ value: input[key], issues: [] }, ctx);
       if (r instanceof Promise) {
-        proms.push(r.then((r) => handlePropertyResult(r, payload, key, input, isOptionalIn, isOptionalOut)));
+        proms.push(r.then((r) => handlePropertyResult(r, payload, key, input, optin, optout)));
       } else {
-        handlePropertyResult(r, payload, key, input, isOptionalIn, isOptionalOut);
+        handlePropertyResult(r, payload, key, input, optin, optout);
       }
     }
 
@@ -2164,13 +2152,15 @@ export const $ZodObjectJIT: core.$constructor<$ZodObject> = /*@__PURE__*/ core.$
         const k = util.esc(key);
         const isPresent = `${k} in input`;
         const schema = shape[key];
-        const isOptionalIn = schema?._zod?.optin !== undefined;
+        const optin = schema?._zod?.optin;
+        const isOptionalIn = optin !== undefined;
         const isOptionalOut = schema?._zod?.optout === "optional";
 
         doc.write(`const ${id} = ${parseStr(key)};`);
 
         if (isOptionalIn && isOptionalOut) {
-          // For optional-in/out schemas, ignore errors on absent keys — and, like the interpreted path, drop the value produced alongside them.
+          // For optional-in/out schemas, ignore errors on absent keys — and, like the interpreted path, drop the value produced alongside them. The middle rung goes further: it permits absence without supplying anything in its place, so an absent key contributes nothing at all.
+          const assign = optin === "optional" ? `${id}_present` : `${id}.value !== undefined || ${id}_present`;
           doc.write(`
         const ${id}_present = ${isPresent};
         if (!${id}.issues.length || ${id}_present) {
@@ -2181,7 +2171,7 @@ export const $ZodObjectJIT: core.$constructor<$ZodObject> = /*@__PURE__*/ core.$
             })));
           }
 
-          if (${id}.value !== undefined || ${id}_present) {
+          if (${assign}) {
             newResult[${k}] = ${id}.value;
           }
         }
@@ -2504,6 +2494,49 @@ export interface $ZodDiscriminatedUnionInternals<
 > extends $ZodUnionInternals<Options> {
   def: $ZodDiscriminatedUnionDef<Options, Disc>;
   propValues: util.PropValues;
+  bag: util.LoosePartial<{
+    optionsMap: Map<util.Primitive, $ZodType>;
+  }>;
+}
+
+/** The discriminator values a member of `Options` can declare. An omittable discriminator contributes `undefined`, matching what `propValues` claims for it. */
+export type $DiscriminatorValue<Options extends readonly SomeType[], Disc extends string> = {
+  [I in keyof Options]: Options[I] extends { _zod: { output: infer Out } }
+    ? Disc extends keyof Out
+      ? Out[Disc]
+      : never
+    : never;
+}[number];
+
+/** The member of `Options` that declares `V`. */
+export type $DiscriminatedOption<Options extends readonly SomeType[], Disc extends string, V> = {
+  [I in keyof Options]: Options[I] extends { _zod: { output: infer Out } }
+    ? Disc extends keyof Out
+      ? V extends Out[Disc]
+        ? Options[I]
+        : never
+      : never
+    : never;
+}[number];
+
+/** Returns the option of `union` whose discriminator claims `value`. */
+export function getDiscriminatedOption<
+  Options extends readonly SomeType[],
+  Disc extends string,
+  const V extends $DiscriminatorValue<Options, Disc>,
+>(union: $ZodDiscriminatedUnion<Options, Disc>, value: V): $DiscriminatedOption<Options, Disc, V> {
+  const internals = union._zod;
+  let map = internals.bag.optionsMap;
+  if (!map) {
+    map = new Map();
+    const { options, discriminator } = internals.def;
+    for (const option of options as unknown as readonly $ZodType[]) {
+      // First declaration wins, matching the order the parse path resolves a duplicate in.
+      for (const v of option._zod.propValues?.[discriminator] ?? []) if (!map.has(v)) map.set(v, option);
+    }
+    internals.bag.optionsMap = map;
+  }
+  return map.get(value as util.Primitive) as any;
 }
 
 export interface $ZodDiscriminatedUnion<
@@ -2539,8 +2572,16 @@ export const $ZodDiscriminatedUnion: core.$constructor<$ZodDiscriminatedUnion> =
       return propValues;
     });
 
+    // Checked now rather than in the lookup map below, so an option that lacks the discriminator fails at the `discriminatedUnion` call instead of on the first object parsed. Options whose shape cannot be enumerated without resolving it — pipes, lazies, and objects rebuilt by a builder such as `.extend()` — are left to the map.
+    def.options.forEach((option, i) => {
+      const propShape = propShapes.get(option._zod.def);
+      if (propShape && !Object.prototype.hasOwnProperty.call(propShape, def.discriminator)) {
+        throw new Error(`Invalid discriminated union option at index "${i}"`);
+      }
+    });
+
     const disc = util.cached(() => {
-      const opts = def.options as $ZodTypeDiscriminable[];
+      const opts = def.options;
       const map: Map<util.Primitive, $ZodType> = new Map();
       for (const o of opts) {
         const values = o._zod.propValues?.[def.discriminator];
@@ -2940,6 +2981,11 @@ function handleTupleResults(
   for (let i = 0; i < items.length; i++) {
     const r = itemResults[i];
     const isPresent = i < input.length;
+    // The array analog of `handlePropertyResult`'s absent-key early return: the middle rung permits absence without supplying anything in its place, so the tail truncates here instead of materializing whatever the item made of `undefined`.
+    if (!isPresent && i >= optoutStart && items[i]._zod.optin === "optional") {
+      final.value.length = i;
+      break;
+    }
     if (r.issues.length) {
       if (!isPresent && i >= optoutStart) {
         final.value.length = i;
